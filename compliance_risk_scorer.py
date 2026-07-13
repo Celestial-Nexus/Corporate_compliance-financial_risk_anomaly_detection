@@ -2,6 +2,9 @@ import math
 import time
 import warnings
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
@@ -289,69 +292,214 @@ def score_geopolitical(df: pd.DataFrame) -> pd.Series:
     return df["Vendor_Country"].map(country_scores)
 
 
-def main() -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# Mahalanobis Distance (real implementation on actual transaction features)
+# ─────────────────────────────────────────────────────────────────────────────
+MAHAL_FEATURES = ["Volume_MT", "Unit_Price_USD", "Total_Value_USD"]
+# Chi-squared threshold for 3-feature space at p=0.975
+MAHAL_CHI2_THRESH = 9.348  # scipy.stats.chi2.ppf(0.975, df=3)
+
+
+def _mahal_distance(X: np.ndarray, mu: np.ndarray, cov_inv: np.ndarray) -> np.ndarray:
+    """Vectorised Mahalanobis distances for all rows of X."""
+    diff = X - mu
+    # (n,d) @ (d,d) → (n,d) then element-wise * diff → sum per row
+    left = diff @ cov_inv
+    sq   = (left * diff).sum(axis=1)
+    return np.sqrt(np.maximum(sq, 0.0))
+
+
+def score_mahalanobis(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """
+    Compute Mahalanobis distance for each transaction using three numeric features.
+    Returns:
+        dist_series  – raw Mahalanobis distance per row
+        score_series – 0–100 risk score (distance relative to chi-sq threshold)
+    """
+    X = df[MAHAL_FEATURES].fillna(df[MAHAL_FEATURES].median()).values.astype(float)
+    mu      = X.mean(axis=0)
+    cov     = np.cov(X, rowvar=False)
+    cov_inv = np.linalg.pinv(cov)
+
+    distances = _mahal_distance(X, mu, cov_inv)
+    threshold = math.sqrt(MAHAL_CHI2_THRESH)
+
+    # Normalise: transactions beyond threshold score toward 100
+    scores = np.clip(distances / threshold * 100.0, 0.0, 100.0)
+
+    dist_series  = pd.Series(distances, index=df.index, name="mahalanobis_distance")
+    score_series = pd.Series(np.round(scores, 4), index=df.index, name="mahalanobis_risk_score")
+    return dist_series, score_series
+
+
+def plot_mahalanobis_scatter(df: pd.DataFrame, dist_series: pd.Series,
+                             threshold: float,
+                             filename: str = "mahalanobis_outliers.png") -> None:
+    """Regenerate mahalanobis_outliers.png from real transaction data."""
+    plt.style.use("ggplot")
+
+    x = np.log1p(df["Total_Value_USD"].clip(lower=0))
+    y = (
+        (df["Unit_Price_USD"] - df["Market_Spot_Price"]).abs()
+        / df["Market_Spot_Price"].replace(0, np.nan) * 100.0
+    ).clip(upper=200).fillna(0)
+
+    is_outlier = dist_series > threshold
+    is_fraud   = df.get("Is_Fraud_Ground_Truth", pd.Series(0, index=df.index)).fillna(0).astype(int)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig.suptitle("Mahalanobis Distance – Multivariate Outlier Detection\n"
+                 "(Real Metallurgical Ledger – 15,030 Transactions)",
+                 fontsize=14, fontweight="bold")
+
+    # Panel 1: Distance histogram
+    ax0 = axes[0]
+    ax0.hist(dist_series, bins=80, color="#3498db", edgecolor="white", alpha=0.75)
+    ax0.axvline(threshold, color="#e74c3c", linewidth=2.5, linestyle="--",
+                label=f"χ² threshold = {threshold:.2f}")
+    ax0.set_xlabel("Mahalanobis Distance", fontsize=11)
+    ax0.set_ylabel("Transaction Count", fontsize=11)
+    ax0.set_title("Distance Distribution", fontweight="bold")
+    ax0.legend()
+    n_out = int(is_outlier.sum())
+    ax0.text(threshold * 1.05, ax0.get_ylim()[1] * 0.7,
+             f"{n_out:,} outliers\n({n_out/len(df)*100:.1f}%)",
+             color="#e74c3c", fontsize=9, fontweight="bold")
+
+    # Panel 2: Feature-space scatter
+    ax1 = axes[1]
+    mask_clean = (~is_outlier) & (is_fraud == 0)
+    mask_out   = is_outlier   & (is_fraud == 0)
+    mask_fraud = is_fraud == 1
+
+    ax1.scatter(x[mask_clean],  y[mask_clean],  c="#3498db", alpha=0.35, s=10,
+                label="Normal", edgecolors="none")
+    ax1.scatter(x[mask_out],    y[mask_out],    c="#f39c12", alpha=0.80, s=45,
+                marker="D", label=f"Mahalanobis Outlier ({n_out:,})")
+    ax1.scatter(x[mask_fraud],  y[mask_fraud],  c="#e74c3c", alpha=0.90, s=55,
+                marker="X", label=f"Ground-Truth Fraud ({is_fraud.sum():,})")
+
+    ax1.set_xlabel("log(Total Value USD)", fontsize=11)
+    ax1.set_ylabel("Price Deviation from Spot (%)", fontsize=11)
+    ax1.set_title("Transaction Feature Space", fontweight="bold")
+    ax1.legend(fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"            Saved → {filename}")
+
+
+def main() -> pd.DataFrame:
     DIVIDER = "=" * 65
 
     print(DIVIDER)
     print("  Corporate Compliance – Financial Risk Anomaly Detection")
     print(DIVIDER)
 
-    print(f"\n[STEP 1/7]  Loading '{INPUT_FILE}' …")
+    print(f"\n[STEP 1/8]  Loading '{INPUT_FILE}' …")
     df = pd.read_excel(INPUT_FILE)
+
+    # Re-attach ground-truth columns if they were dropped
+    if "Is_Fraud_Ground_Truth" not in df.columns or "Fraud_Type" not in df.columns:
+        try:
+            raw = pd.read_csv("metallurgical_ledgers.csv")
+            for col in ["Is_Fraud_Ground_Truth", "Fraud_Type"]:
+                if col not in df.columns and col in raw.columns:
+                    df = df.merge(raw[["Transaction_ID", col]], on="Transaction_ID", how="left")
+        except FileNotFoundError:
+            pass
+
     print(f"            {len(df):,} transactions | {df['Vendor_ID'].nunique()} unique vendors")
 
-    print("\n[STEP 2/7]  OFAC List Cross-Reference …")
+    print("\n[STEP 2/8]  OFAC List Cross-Reference …")
     sanctioned_set = fetch_ofac_sanctioned_set()
     df["ofac_risk_score"] = score_ofac(df, sanctioned_set)
     n_flagged = int((df["ofac_risk_score"] == 100).sum())
     print(f"            Flagged transactions: {n_flagged:,} ({n_flagged / len(df) * 100:.1f} %)")
 
-    print("\n[STEP 3/7]  Price Delta (Trade-Based Arbitrage) …")
+    print("\n[STEP 3/8]  Price Delta (Trade-Based Arbitrage) …")
     df["price_delta_risk_score"] = score_price_delta(df)
     print(f"            Mean = {df['price_delta_risk_score'].mean():.2f}  Max = {df['price_delta_risk_score'].max():.2f}")
 
-    print("\n[STEP 4/7]  Smurfing & Structuring (Volume Anomalies) …")
+    print("\n[STEP 4/8]  Smurfing & Structuring (Volume Anomalies) …")
     df["smurfing_risk_score"] = score_smurfing(df)
     print(f"            Mean = {df['smurfing_risk_score'].mean():.2f}  Max = {df['smurfing_risk_score'].max():.2f}")
 
-    print("\n[STEP 5/7]  Benford's Law Deviation …")
+    print("\n[STEP 5/8]  Benford's Law Deviation …")
     df["benfords_law_risk_score"] = score_benfords_law(df)
     print(f"            Mean = {df['benfords_law_risk_score'].mean():.2f}  Max = {df['benfords_law_risk_score'].max():.2f}")
 
-    print("\n[STEP 6/7]  Geopolitical Risk (World Bank + Comtrade) …")
+    print("\n[STEP 6/8]  Geopolitical Risk (World Bank + Comtrade) …")
     df["geopolitical_risk_score"] = score_geopolitical(df)
     print(f"            Mean = {df['geopolitical_risk_score'].mean():.2f}  Max = {df['geopolitical_risk_score'].max():.2f}")
 
-    print(f"\n[STEP 7/7]  Writing '{OUTPUT_FILE}' …")
-    df.to_excel(OUTPUT_FILE, index=False)
-    print(f"            Saved {len(df):,} rows × {len(df.columns)} columns.")
+    print("\n[STEP 7/8]  Mahalanobis Distance Anomaly Detection …")
+    dist_series, mahal_score = score_mahalanobis(df)
+    df["mahalanobis_risk_score"] = mahal_score
+    threshold = math.sqrt(MAHAL_CHI2_THRESH)
+    n_out = int((dist_series > threshold).sum())
+    print(f"            Threshold : {threshold:.4f} (χ² 97.5th pct, 3 features)")
+    print(f"            Outliers  : {n_out:,} ({n_out / len(df) * 100:.2f}%)")
+    print(f"            Mean score= {mahal_score.mean():.2f}  Max = {mahal_score.max():.2f}")
+    plot_mahalanobis_scatter(df, dist_series, threshold)
 
+    # ── Composite risk score (weighted sum) ─────────────────────────────────
     score_cols = [
         "ofac_risk_score",
         "price_delta_risk_score",
         "smurfing_risk_score",
         "benfords_law_risk_score",
         "geopolitical_risk_score",
+        "mahalanobis_risk_score",
     ]
+    WEIGHTS = {
+        "ofac_risk_score":          0.30,
+        "price_delta_risk_score":   0.20,
+        "smurfing_risk_score":      0.15,
+        "benfords_law_risk_score":  0.10,
+        "geopolitical_risk_score":  0.15,
+        "mahalanobis_risk_score":   0.10,
+    }
+    df["composite_risk_score"] = sum(
+        df[col] * w for col, w in WEIGHTS.items() if col in df.columns
+    ).round(4)
+    df["risk_tier"] = df["composite_risk_score"].apply(
+        lambda s: "CRITICAL" if s >= 75 else
+                  "HIGH"     if s >= 50 else
+                  "MEDIUM"   if s >= 25 else "LOW"
+    )
+
+    print(f"\n[STEP 8/8]  Writing '{OUTPUT_FILE}' …")
+    df.to_excel(OUTPUT_FILE, index=False)
+    print(f"            Saved {len(df):,} rows × {len(df.columns)} columns.")
 
     print("\n" + DIVIDER)
     print("  RISK SCORE DISTRIBUTION SUMMARY")
     print(DIVIDER)
-    summary = df[score_cols].describe().round(2)
+    all_score_cols = score_cols + ["composite_risk_score"]
+    summary = df[all_score_cols].describe().round(2)
     summary.index.name = "Statistic"
     print(summary.to_string())
 
     print("\n" + DIVIDER)
-    print("  TOP-10 HIGHEST-RISK TRANSACTIONS (by sum of all scores)")
+    print("  RISK TIER DISTRIBUTION")
     print(DIVIDER)
-    df["_total_risk"] = df[score_cols].sum(axis=1)
-    top10 = df.nlargest(10, "_total_risk")[
-        ["Transaction_ID", "Date", "Vendor_ID", "Vendor_Country"] + score_cols + ["_total_risk"]
+    tier_counts = df["risk_tier"].value_counts()
+    for tier, cnt in tier_counts.items():
+        print(f"    {tier:<10}: {cnt:,} ({cnt/len(df)*100:.1f}%)")
+
+    print("\n" + DIVIDER)
+    print("  TOP-10 HIGHEST-RISK TRANSACTIONS (composite score)")
+    print(DIVIDER)
+    top10 = df.nlargest(10, "composite_risk_score")[
+        ["Transaction_ID", "Date", "Vendor_ID", "Vendor_Country", "Fraud_Type",
+         "composite_risk_score", "risk_tier"] + score_cols
     ]
     print(top10.to_string(index=False))
-    df.drop(columns=["_total_risk"], inplace=True)
 
     print(f"\n✓ Done. Scored workbook saved to: {OUTPUT_FILE}\n")
+    return df
 
 
 if __name__ == "__main__":

@@ -1,19 +1,9 @@
 """
-comtrade_api.py
-────────────────────────────────────────────────────────────────────────────
-Corporate Compliance – UN Comtrade Trade Flow Fetcher
-
-Fetches official import/export trade flow data from the UN Comtrade public
-API for the commodities present in the metallurgical ledger:
-    • HS Chapter 71 – Gold, Silver, precious metals
-    • HS Chapter 74 – Copper and articles thereof
-    • HS Chapter 76 – Aluminum and articles thereof
-
-Country coverage matches the ledger's vendor countries.
-Results are used to validate whether ledger transaction volumes are
-plausible relative to official bilateral trade statistics (TBML check).
+Fetches UN Comtrade bilateral trade data for commodities.
+Used to validate ledger transaction volumes against official statistics.
 """
 
+import os
 import time
 import warnings
 
@@ -22,17 +12,21 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+_DATA_DIR    = os.path.join(_PROJECT_DIR, "data")
+_OUTPUT_DIR  = os.path.join(_PROJECT_DIR, "outputs")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+# config
 BASE_URL     = "https://comtradeapi.un.org/public/v1/preview/C/A/HS"
 REQUEST_DELAY = 0.8          # seconds between requests (rate-limit friendly)
 TIMEOUT       = 30
 
-# UN M49 reporter/partner codes
+# m49 reporter/partner codes
 REPORTER_USA = 842           # United States (reporter for bilateral flows)
 
-# All vendor countries in the ledger → M49 codes
+# vendor countries to m49 codes
 COUNTRY_M49 = {
     "Australia":             36,
     "Canada":               124,
@@ -44,14 +38,14 @@ COUNTRY_M49 = {
     "United States":        840,
 }
 
-# HS chapters relevant to the ledger commodities
+# hs chapters for ledger commodities
 HS_CHAPTERS = {
     "71": "Precious Metals (Gold / Silver)",
     "74": "Copper & Articles",
     "76": "Aluminum & Articles",
 }
 
-# Commodity → HS chapter mapping
+# commodity to hs chapter mapping
 COMMODITY_HS = {
     "Gold_Bullion":   "71",
     "Silver_Ingot":   "71",
@@ -60,20 +54,15 @@ COMMODITY_HS = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core fetcher
-# ─────────────────────────────────────────────────────────────────────────────
+# core fetcher
 def fetch_trade_flow(
     reporter_code: int,
     partner_code:  int,
     period:        int,
-    flow_code:     str,   # "M" = Imports, "X" = Exports
+    flow_code:     str,
     hs_chapter:    str,
 ) -> float | None:
-    """
-    Fetch a single bilateral trade flow value from Comtrade.
-    Returns the total primaryValue in USD, or None on error.
-    """
+    """Fetch a single bilateral trade flow value."""
     params = {
         "reporterCode": reporter_code,
         "partnerCode":  partner_code,
@@ -103,11 +92,7 @@ def fetch_all_flows(
     flow_code: str = "M",
     reporter: int = REPORTER_USA,
 ) -> pd.DataFrame:
-    """
-    Fetch import flows for all country × HS chapter combinations.
-    Returns a DataFrame with columns:
-        country | m49_code | hs_chapter | hs_description | trade_value_usd
-    """
+    """Fetch import flows for all combinations of country and HS chapter."""
     print(f"  [Comtrade] Fetching {flow_code} flows | "
           f"Reporter=USA({reporter}) | Period={period} …")
 
@@ -139,12 +124,8 @@ def compare_with_ledger(
     flows_df:   pd.DataFrame,
     ledger_df:  pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Compare official Comtrade bilateral totals vs. ledger-recorded totals
-    per country + commodity cluster (HS chapter).
-    High ledger/comtrade ratio signals potential TBML over-invoicing.
-    """
-    # Map commodities to HS chapters
+    """Compare Comtrade totals with ledger totals to flag potential over-invoicing."""
+    # map commodities to hs chapters
     ledger_df = ledger_df.copy()
     ledger_df["hs_chapter"] = ledger_df["Commodity"].map(COMMODITY_HS)
 
@@ -158,7 +139,7 @@ def compare_with_ledger(
         })
     )
 
-    # Aggregate comtrade per country + hs
+    # aggregate comtrade per country and hs
     ct_agg = (
         flows_df[flows_df["trade_value_usd"].notna()]
         .groupby(["country", "hs_chapter"])["trade_value_usd"]
@@ -196,18 +177,18 @@ def main() -> dict:
 
     print("\n[STEP 3/3]  Cross-referencing with ledger …")
     try:
-        ledger = pd.read_csv("metallurgical_ledgers.csv")
+        ledger = pd.read_csv(os.path.join(_DATA_DIR, "metallurgical_ledgers.csv"))
         comparison = compare_with_ledger(flows, ledger)
         print(comparison[["country","hs_chapter","ledger_total_usd",
                             "comtrade_total_usd","ledger_comtrade_ratio","tbml_flag"]].to_string(index=False))
-        comparison.to_csv("comtrade_comparison.csv", index=False)
-        print("  Exported → comtrade_comparison.csv")
+        comparison.to_csv(os.path.join(_OUTPUT_DIR, "comtrade_comparison.csv"), index=False)
+        print("  Exported → outputs/comtrade_comparison.csv")
     except FileNotFoundError:
         print("  Ledger CSV not found – skipping comparison.")
         comparison = pd.DataFrame()
 
-    flows.to_csv("comtrade_flows.csv", index=False)
-    print("  Exported → comtrade_flows.csv")
+    flows.to_csv(os.path.join(_OUTPUT_DIR, "comtrade_flows.csv"), index=False)
+    print("  Exported → outputs/comtrade_flows.csv")
 
     print(f"\n✓ Comtrade fetch complete.\n")
     return {"flows": flows, "comparison": comparison}

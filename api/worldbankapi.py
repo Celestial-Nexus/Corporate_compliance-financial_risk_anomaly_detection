@@ -1,27 +1,9 @@
 """
-worldbankapi.py
-────────────────────────────────────────────────────────────────────────────
-Corporate Compliance – World Bank Indicator Fetcher
-
-Fetches geopolitical and economic risk indicators from the World Bank API
-for all vendor countries present in the metallurgical ledger:
-
-    Indicators fetched
-    ──────────────────
-    • LP.LPI.OVRL.XQ  – Logistics Performance Index (overall score)
-    • NY.GDP.PCAP.CD   – GDP per capita (current USD)
-    • GE.EST           – Government Effectiveness (World Governance Indicator)
-    • CC.EST           – Control of Corruption (WGI)
-    • FP.CPI.TOTL.ZG   – Inflation rate (CPI % change)
-
-Outputs
-───────
-    • pandas DataFrame with all indicators per country
-    • CSV export: worldbank_risk_indicators.csv
-    • Risk scores (0–100) derived from each indicator for use in the
-      composite compliance score
+Fetches geopolitical and economic risk indicators from the World Bank API.
+Derives risk scores for vendor countries.
 """
 
+import os
 import time
 import warnings
 
@@ -33,9 +15,13 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+_DATA_DIR    = os.path.join(_PROJECT_DIR, "data")
+_OUTPUT_DIR  = os.path.join(_PROJECT_DIR, "outputs")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+# config
 WB_BASE_URL   = "https://api.worldbank.org/v2"
 REQUEST_DELAY = 0.5
 TIMEOUT       = 30
@@ -69,7 +55,7 @@ INDICATORS = {
     },
 }
 
-# All vendor countries → ISO2 codes
+# vendor countries to iso2 codes
 COUNTRY_ISO2 = {
     "Australia":              "AU",
     "Canada":                 "CA",
@@ -82,15 +68,10 @@ COUNTRY_ISO2 = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# API helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# api helpers
 def fetch_indicator(indicator_code: str, iso2_codes: list[str]) -> dict:
-    """
-    Fetch the most-recent value for `indicator_code` for a list of ISO2 codes.
-    Returns { iso2: value } dict.
-    """
-    # Batch all countries in one request
+    """Fetch the most-recent value for an indicator for given ISO2 codes."""
+    # batch all countries in one request
     country_str = ";".join(iso2_codes)
     url = f"{WB_BASE_URL}/country/{country_str}/indicator/{indicator_code}"
     params = {"format": "json", "per_page": 500, "mrv": 3}
@@ -117,20 +98,15 @@ def fetch_indicator(indicator_code: str, iso2_codes: list[str]) -> dict:
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Risk score derivation
-# ─────────────────────────────────────────────────────────────────────────────
+# risk score derivation
 def _derive_risk_score(value: float, cfg: dict) -> float:
-    """
-    Normalise an indicator value to a 0–100 risk score.
-    0 = lowest risk, 100 = highest risk.
-    """
+    """Normalize an indicator value to a 0-100 risk score."""
     import math
     lo, hi = cfg["scale"]
     direction = cfg["direction"]
 
     if cfg.get("log_scale"):
-        # Log-normalise
+        # log-normalize
         norm = math.log10(max(value, 1)) / math.log10(hi) if hi > 0 else 0.5
     else:
         norm = (value - lo) / (hi - lo) if hi != lo else 0.5
@@ -138,23 +114,18 @@ def _derive_risk_score(value: float, cfg: dict) -> float:
     norm = max(0.0, min(1.0, norm))
 
     if direction == "lower_worse":
-        # Low value → high risk
+        # low value means high risk
         risk = 1.0 - norm
     else:
-        # High value → high risk
+        # high value means high risk
         risk = norm
 
     return round(risk * 100.0, 2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main fetch function
-# ─────────────────────────────────────────────────────────────────────────────
+# main fetch function
 def fetch_all_indicators() -> pd.DataFrame:
-    """
-    Fetch all indicators for all vendor countries.
-    Returns a pivoted DataFrame: rows = countries, columns = indicators.
-    """
+    """Fetch all indicators for vendor countries."""
     iso2_list = list(COUNTRY_ISO2.values())
     all_data  = {}
 
@@ -164,7 +135,7 @@ def fetch_all_indicators() -> pd.DataFrame:
         all_data[code] = values
         time.sleep(REQUEST_DELAY)
 
-    # Build wide DataFrame
+    # build wide dataframe
     rows = []
     for country, iso2 in COUNTRY_ISO2.items():
         row = {"country": country, "iso2": iso2}
@@ -183,11 +154,11 @@ def fetch_all_indicators() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Visualisation
-# ─────────────────────────────────────────────────────────────────────────────
-def plot_country_risk(df: pd.DataFrame, filename: str = "worldbank_risk.png") -> None:
-    """Horizontal bar chart of composite World Bank risk per country."""
+# visualization
+def plot_country_risk(df: pd.DataFrame, filename: str = None) -> None:
+    """Bar chart of composite World Bank risk per country."""
+    if filename is None:
+        filename = os.path.join(_OUTPUT_DIR, "worldbank_risk.png")
     plt.style.use("ggplot")
 
     df_sorted = df.sort_values("composite_wb_risk", ascending=True)
@@ -211,9 +182,7 @@ def plot_country_risk(df: pd.DataFrame, filename: str = "worldbank_risk.png") ->
     print(f"  Saved → {filename}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+# main
 def main() -> pd.DataFrame:
     DIVIDER = "=" * 65
     print(DIVIDER)
@@ -230,8 +199,8 @@ def main() -> pd.DataFrame:
     print(df[[c for c in display_cols if c in df.columns]].to_string(index=False))
 
     print("\n[STEP 3/3]  Exporting …")
-    df.to_csv("worldbank_risk_indicators.csv", index=False)
-    print("  Exported → worldbank_risk_indicators.csv")
+    df.to_csv(os.path.join(_OUTPUT_DIR, "worldbank_risk_indicators.csv"), index=False)
+    print("  Exported → outputs/worldbank_risk_indicators.csv")
     plot_country_risk(df)
 
     print(f"\n✓ World Bank fetch complete.\n")

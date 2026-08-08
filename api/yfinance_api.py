@@ -1,19 +1,9 @@
 """
-yfinance_api.py
-────────────────────────────────────────────────────────────────────────────
-Corporate Compliance – Metal Spot Price Fetcher (Yahoo Finance)
-
-Fetches real-time and historical spot prices for the four commodities in the
-metallurgical ledger:
-    • Gold Bullion   → GC=F (COMEX Gold Futures)
-    • Silver Ingot   → SI=F (COMEX Silver Futures)
-    • Copper Cathode → HG=F (COMEX Copper Futures, USD/lb → converted to MT)
-    • Aluminum Ingot → ALI=F (LME Aluminum Futures, USD/MT)
-
-Also computes a price-validity check against the ledger's Market_Spot_Price
-column to flag systematic over/under-invoicing.
+Fetches real-time and historical spot prices for commodities.
+Validates ledger prices against market spot prices.
 """
 
+import os
 import warnings
 from datetime import datetime
 
@@ -22,9 +12,13 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ticker map + unit conversion factors to USD / troy-oz or USD / MT
-# ─────────────────────────────────────────────────────────────────────────────
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+_DATA_DIR    = os.path.join(_PROJECT_DIR, "data")
+_OUTPUT_DIR  = os.path.join(_PROJECT_DIR, "outputs")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+# ticker map and unit conversion factors
 METAL_TICKERS = {
     "Gold_Bullion":   {"ticker": "GC=F",  "unit": "USD/troy-oz",  "factor": 1.0},
     "Silver_Ingot":   {"ticker": "SI=F",  "unit": "USD/troy-oz",  "factor": 1.0},
@@ -33,7 +27,7 @@ METAL_TICKERS = {
 }
 
 LEDGER_PRICE_UNITS = {
-    # The ledger stores Market_Spot_Price in the following units per commodity
+    # ledger stores Market_Spot_Price in these units
     "Gold_Bullion":   "USD/troy-oz",
     "Silver_Ingot":   "USD/troy-oz",
     "Copper_Cathode": "USD/lb",
@@ -42,10 +36,7 @@ LEDGER_PRICE_UNITS = {
 
 
 def fetch_current_spot_prices() -> dict:
-    """
-    Fetch the latest closing price for each metal from Yahoo Finance.
-    Returns a dict: { commodity_name: current_price_float }
-    """
+    """Fetch the latest closing price for each metal."""
     spots = {}
     print("  [yfinance] Fetching current metal spot prices …")
     for commodity, cfg in METAL_TICKERS.items():
@@ -67,10 +58,7 @@ def fetch_current_spot_prices() -> dict:
 
 
 def fetch_historical_spot_prices(period: str = "1y") -> pd.DataFrame:
-    """
-    Fetch historical daily closing prices for all metals.
-    Returns a DataFrame with columns = commodity names, index = Date.
-    """
+    """Fetch historical daily closing prices for all metals."""
     print(f"\n  [yfinance] Fetching {period} historical prices …")
     frames = {}
     for commodity, cfg in METAL_TICKERS.items():
@@ -93,16 +81,7 @@ def validate_ledger_prices(
     spot_prices: dict,
     tolerance_pct: float = 5.0,
 ) -> pd.DataFrame:
-    """
-    Compare the ledger's Market_Spot_Price against real Yahoo Finance prices.
-    Returns a summary DataFrame flagging commodities with significant drift.
-
-    Parameters
-    ──────────
-    ledger_df     : pd.DataFrame with columns [Commodity, Market_Spot_Price]
-    spot_prices   : dict returned by fetch_current_spot_prices()
-    tolerance_pct : flag if avg ledger price differs from current spot by > this %
-    """
+    """Compare ledger prices against market prices and flag significant deviations."""
     rows = []
     for commodity, yf_price in spot_prices.items():
         if yf_price is None:
@@ -128,18 +107,18 @@ def main() -> dict:
     print("  Yahoo Finance – Metal Spot Price Fetcher")
     print(DIVIDER)
 
-    # 1. Current spot prices
+    # 1. current spot prices
     spots = fetch_current_spot_prices()
 
-    # 2. Historical prices (1 year)
+    # 2. historical prices
     hist_df = fetch_historical_spot_prices(period="1y")
     if not hist_df.empty:
         print(f"\n  Historical price table ({len(hist_df)} trading days):")
         print(hist_df.tail(5).round(4).to_string())
 
-    # 3. Cross-validate against ledger
+    # 3. cross-validate against ledger
     try:
-        ledger = pd.read_csv("metallurgical_ledgers.csv")
+        ledger = pd.read_csv(os.path.join(_DATA_DIR, "metallurgical_ledgers.csv"))
         print("\n  [yfinance] Ledger price validation …")
         validation = validate_ledger_prices(ledger, spots)
         print(validation.to_string(index=False))

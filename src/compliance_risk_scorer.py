@@ -1,4 +1,5 @@
 import math
+import os
 import time
 import warnings
 
@@ -11,8 +12,15 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-INPUT_FILE  = "metallurgical_ledgers.xlsx"
-OUTPUT_FILE = "metallurgical_ledgers_scored.xlsx"
+# path resolution
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+_DATA_DIR    = os.path.join(_PROJECT_DIR, "data")
+_OUTPUT_DIR  = os.path.join(_PROJECT_DIR, "outputs")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+INPUT_FILE   = os.path.join(_DATA_DIR, "metallurgical_ledgers.csv")
+OUTPUT_FILE  = os.path.join(_OUTPUT_DIR, "metallurgical_ledgers_scored.xlsx")
 
 OFAC_SDN_URL = "https://www.treasury.gov/ofac/downloads/sdn.csv"
 
@@ -192,6 +200,42 @@ def score_benfords_law(df: pd.DataFrame) -> pd.Series:
     return df_work["Vendor_ID"].map(vendor_scores)
 
 
+def plot_benfords_chart(df: pd.DataFrame, filename: str = None) -> None:
+    """Bar chart comparing observed vs expected leading-digit frequencies."""
+    if filename is None:
+        filename = os.path.join(_OUTPUT_DIR, "benfords_law.png")
+    plt.style.use("ggplot")
+
+    digits_col = df["Total_Value_USD"].apply(_leading_digit).dropna().astype(int)
+    total = len(digits_col)
+
+    observed = [(digits_col == d).sum() / total * 100 for d in range(1, 10)]
+    expected = [BENFORD_EXPECTED[d] * 100 for d in range(1, 10)]
+
+    x = np.arange(1, 10)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(x - 0.2, expected, width=0.4, label="Expected (Benford's Law)",
+           color="#95a5a6", edgecolor="white")
+    ax.bar(x + 0.2, observed, width=0.4, label="Observed (Ledger Data)",
+           color="#e67e22", edgecolor="white")
+
+    for i, (o, e) in enumerate(zip(observed, expected)):
+        if abs(o - e) > 2.0:
+            ax.annotate(f"Δ{abs(o-e):.1f}%", xy=(i+1, max(o, e) + 0.5),
+                        ha="center", fontsize=8, color="#e74c3c", fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xlabel("Leading Digit", fontsize=12)
+    ax.set_ylabel("Frequency (%)", fontsize=12)
+    ax.set_title("Benford's Law Analysis - Invoice Leading Digit Distribution",
+                 fontweight="bold", fontsize=13)
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"            Saved → {os.path.basename(filename)}")
+
+
 def _wb_fetch_indicator(indicator: str) -> dict:
     url    = f"{WB_BASE_URL}/country/all/indicator/{indicator}"
     params = {"format": "json", "per_page": 1000, "mrv": 1}
@@ -292,16 +336,14 @@ def score_geopolitical(df: pd.DataFrame) -> pd.Series:
     return df["Vendor_Country"].map(country_scores)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mahalanobis Distance (real implementation on actual transaction features)
-# ─────────────────────────────────────────────────────────────────────────────
+# mahalanobis distance calculations
 MAHAL_FEATURES = ["Volume_MT", "Unit_Price_USD", "Total_Value_USD"]
-# Chi-squared threshold for 3-feature space at p=0.975
+# chi-sq threshold for 3 features at p=0.975
 MAHAL_CHI2_THRESH = 9.348  # scipy.stats.chi2.ppf(0.975, df=3)
 
 
 def _mahal_distance(X: np.ndarray, mu: np.ndarray, cov_inv: np.ndarray) -> np.ndarray:
-    """Vectorised Mahalanobis distances for all rows of X."""
+    """Mahalanobis distance for each row in X."""
     diff = X - mu
     # (n,d) @ (d,d) → (n,d) then element-wise * diff → sum per row
     left = diff @ cov_inv
@@ -310,12 +352,7 @@ def _mahal_distance(X: np.ndarray, mu: np.ndarray, cov_inv: np.ndarray) -> np.nd
 
 
 def score_mahalanobis(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
-    """
-    Compute Mahalanobis distance for each transaction using three numeric features.
-    Returns:
-        dist_series  – raw Mahalanobis distance per row
-        score_series – 0–100 risk score (distance relative to chi-sq threshold)
-    """
+    """Compute Mahalanobis distance for each transaction."""
     X = df[MAHAL_FEATURES].fillna(df[MAHAL_FEATURES].median()).values.astype(float)
     mu      = X.mean(axis=0)
     cov     = np.cov(X, rowvar=False)
@@ -324,7 +361,7 @@ def score_mahalanobis(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     distances = _mahal_distance(X, mu, cov_inv)
     threshold = math.sqrt(MAHAL_CHI2_THRESH)
 
-    # Normalise: transactions beyond threshold score toward 100
+    # scale scores to 0-100 based on threshold
     scores = np.clip(distances / threshold * 100.0, 0.0, 100.0)
 
     dist_series  = pd.Series(distances, index=df.index, name="mahalanobis_distance")
@@ -334,8 +371,10 @@ def score_mahalanobis(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
 
 def plot_mahalanobis_scatter(df: pd.DataFrame, dist_series: pd.Series,
                              threshold: float,
-                             filename: str = "mahalanobis_outliers.png") -> None:
-    """Regenerate mahalanobis_outliers.png from real transaction data."""
+                             filename: str = None) -> None:
+    """Scatter plot of Mahalanobis outliers with fraud overlay."""
+    if filename is None:
+        filename = os.path.join(_OUTPUT_DIR, "mahalanobis_outliers.png")
     plt.style.use("ggplot")
 
     x = np.log1p(df["Total_Value_USD"].clip(lower=0))
@@ -348,8 +387,7 @@ def plot_mahalanobis_scatter(df: pd.DataFrame, dist_series: pd.Series,
     is_fraud   = df.get("Is_Fraud_Ground_Truth", pd.Series(0, index=df.index)).fillna(0).astype(int)
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    fig.suptitle("Mahalanobis Distance – Multivariate Outlier Detection\n"
-                 "(Real Metallurgical Ledger – 15,030 Transactions)",
+    fig.suptitle("Mahalanobis Distance - Multivariate Outlier Detection",
                  fontsize=14, fontweight="bold")
 
     # Panel 1: Distance histogram
@@ -397,13 +435,13 @@ def main() -> pd.DataFrame:
     print("  Corporate Compliance – Financial Risk Anomaly Detection")
     print(DIVIDER)
 
-    print(f"\n[STEP 1/8]  Loading '{INPUT_FILE}' …")
-    df = pd.read_excel(INPUT_FILE)
+    print(f"\n[STEP 1/8]  Loading '{os.path.basename(INPUT_FILE)}' …")
+    df = pd.read_csv(INPUT_FILE, parse_dates=["Date"])
 
     # Re-attach ground-truth columns if they were dropped
     if "Is_Fraud_Ground_Truth" not in df.columns or "Fraud_Type" not in df.columns:
         try:
-            raw = pd.read_csv("metallurgical_ledgers.csv")
+            raw = pd.read_csv(os.path.join(_DATA_DIR, "metallurgical_ledgers.csv"))
             for col in ["Is_Fraud_Ground_Truth", "Fraud_Type"]:
                 if col not in df.columns and col in raw.columns:
                     df = df.merge(raw[["Transaction_ID", col]], on="Transaction_ID", how="left")
@@ -429,6 +467,7 @@ def main() -> pd.DataFrame:
     print("\n[STEP 5/8]  Benford's Law Deviation …")
     df["benfords_law_risk_score"] = score_benfords_law(df)
     print(f"            Mean = {df['benfords_law_risk_score'].mean():.2f}  Max = {df['benfords_law_risk_score'].max():.2f}")
+    plot_benfords_chart(df)
 
     print("\n[STEP 6/8]  Geopolitical Risk (World Bank + Comtrade) …")
     df["geopolitical_risk_score"] = score_geopolitical(df)
@@ -444,7 +483,7 @@ def main() -> pd.DataFrame:
     print(f"            Mean score= {mahal_score.mean():.2f}  Max = {mahal_score.max():.2f}")
     plot_mahalanobis_scatter(df, dist_series, threshold)
 
-    # ── Composite risk score (weighted sum) ─────────────────────────────────
+    # weighted composite score
     score_cols = [
         "ofac_risk_score",
         "price_delta_risk_score",

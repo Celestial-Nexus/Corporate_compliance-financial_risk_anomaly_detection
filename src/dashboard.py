@@ -1,20 +1,6 @@
 """
-dashboard.py
-────────────────────────────────────────────────────────────────────────────
-Corporate Compliance – Interactive Plotly Dash Dashboard
-
-Mirrors a PowerBI compliance dashboard with the following panels:
-    1. KPI Cards          – key summary statistics
-    2. TBML Heatmap       – country × commodity risk heatmap
-    3. Benford's Law      – observed vs expected digit frequency (real data)
-    4. Mahalanobis Scatter– outlier detection scatter (real data)
-    5. Risk Score Dist.   – histogram per risk dimension
-    6. Vendor Risk Table  – sortable top-risk vendor table
-    7. Time Series        – transaction volume and risk over time
-    8. Model Metrics      – fraud detection model performance
-
-Run:  python3 dashboard.py
-Open: http://127.0.0.1:8050
+Interactive Plotly Dash Dashboard for Corporate Compliance.
+Displays risk metrics, anomaly detection results, and model performance.
 """
 
 import math
@@ -32,12 +18,21 @@ import dash_bootstrap_components as dbc
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Load Data
-# ─────────────────────────────────────────────────────────────────────────────
+# path resolution
+import os
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+_DATA_DIR    = os.path.join(_PROJECT_DIR, "data")
+_OUTPUT_DIR  = os.path.join(_PROJECT_DIR, "outputs")
+
+# load data
 def load_data() -> pd.DataFrame:
-    """Load the scored workbook; fall back to raw CSV if needed."""
-    for path in ["metallurgical_ledgers_scored.xlsx", "metallurgical_ledgers.csv"]:
+    """Load the scored workbook or raw CSV."""
+    paths = [
+        os.path.join(_OUTPUT_DIR, "metallurgical_ledgers_scored.xlsx"),
+        os.path.join(_DATA_DIR, "metallurgical_ledgers.csv"),
+    ]
+    for path in paths:
         try:
             if path.endswith(".xlsx"):
                 df = pd.read_excel(path)
@@ -47,7 +42,7 @@ def load_data() -> pd.DataFrame:
             # Re-attach ground-truth if missing
             if "Is_Fraud_Ground_Truth" not in df.columns:
                 try:
-                    raw = pd.read_csv("metallurgical_ledgers.csv")
+                    raw = pd.read_csv(os.path.join(_DATA_DIR, "metallurgical_ledgers.csv"))
                     df  = df.merge(raw[["Transaction_ID","Is_Fraud_Ground_Truth","Fraud_Type"]],
                                    on="Transaction_ID", how="left")
                 except FileNotFoundError:
@@ -59,12 +54,10 @@ def load_data() -> pd.DataFrame:
             return df
         except FileNotFoundError:
             continue
-    raise FileNotFoundError("No data file found. Run compliance_risk_scorer.py first.")
+    raise FileNotFoundError("No data file found. Run src/compliance_risk_scorer.py first.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Benford's Law helper (computed from real data)
-# ─────────────────────────────────────────────────────────────────────────────
+# benford's law helper
 BENFORD_EXPECTED = {d: math.log10(1 + 1/d) * 100 for d in range(1, 10)}
 
 
@@ -94,9 +87,7 @@ def compute_benford(df: pd.DataFrame, col: str = "Total_Value_USD") -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mahalanobis distance (inline, no sklearn needed)
-# ─────────────────────────────────────────────────────────────────────────────
+# mahalanobis distance
 def compute_mahalanobis_dash(df: pd.DataFrame) -> pd.Series:
     features = ["Volume_MT", "Unit_Price_USD", "Total_Value_USD"]
     X       = df[features].fillna(df[features].median()).values.astype(float)
@@ -107,9 +98,7 @@ def compute_mahalanobis_dash(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.sqrt(np.maximum(sq, 0.0)), index=df.index)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Score columns
-# ─────────────────────────────────────────────────────────────────────────────
+# score columns
 SCORE_COLS = [
     "ofac_risk_score",
     "price_delta_risk_score",
@@ -137,9 +126,7 @@ RISK_COLORS = {
     "LOW":      "#27ae60",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# App
-# ─────────────────────────────────────────────────────────────────────────────
+# app
 df_global = load_data()
 
 # Compute mahalanobis if column absent
@@ -167,9 +154,7 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KPI Card helper
-# ─────────────────────────────────────────────────────────────────────────────
+# kpi card helper
 def kpi_card(title: str, value: str, subtitle: str = "", color: str = "#3498db") -> dbc.Card:
     return dbc.Card(
         dbc.CardBody([
@@ -182,9 +167,7 @@ def kpi_card(title: str, value: str, subtitle: str = "", color: str = "#3498db")
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Layout
-# ─────────────────────────────────────────────────────────────────────────────
+# layout
 COUNTRIES   = sorted(df_global["Vendor_Country"].unique().tolist())
 COMMODITIES = sorted(df_global["Commodity"].unique().tolist())
 RISK_TIERS  = sorted(df_global.get("risk_tier", pd.Series(["LOW"])).unique().tolist()) if "risk_tier" in df_global.columns else ["LOW"]
@@ -401,9 +384,7 @@ app.layout = dbc.Container(
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Callbacks
-# ─────────────────────────────────────────────────────────────────────────────
+# callbacks
 def apply_filters(countries, commodities, tiers) -> pd.DataFrame:
     dff = df_global.copy()
     if countries:
@@ -754,9 +735,7 @@ def update_model_metrics(countries, commodities, tiers):
     return fig
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Export as HTML (for sharing / PowerBI-equivalent)
-# ─────────────────────────────────────────────────────────────────────────────
+# export as html
 def export_html(filename: str = "compliance_dashboard.html") -> None:
     """Generate a static HTML snapshot of the key charts."""
     print(f"  [Dashboard] Generating static HTML export …")
@@ -773,7 +752,7 @@ def export_html(filename: str = "compliance_dashboard.html") -> None:
         go.Bar(x=bdf["digit"], y=bdf["observed"], name="Observed (Ledger)",
                marker_color="#e67e22"),
     ])
-    ben_fig.update_layout(title="Benford's Law – Invoice Leading Digits (Real Data)",
+    ben_fig.update_layout(title="Benford's Law - Invoice Leading Digits",
                            barmode="group", template="plotly_dark")
     figs["benfords"] = ben_fig
 

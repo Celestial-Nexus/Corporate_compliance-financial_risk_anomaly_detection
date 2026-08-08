@@ -1,36 +1,26 @@
 """
-sql_pipeline.py
-────────────────────────────────────────────────────────────────────────────
-Corporate Compliance – Trade-Compliance SQL Pipeline
-Uses SQLite to manage the metallurgical ledger data pipeline.
-
-Capabilities
-────────────
-• Ingests CSV → normalised SQLite tables (transactions, vendors, risk_scores)
-• Analytical queries:
-    – TBML pattern detection (CTEs + window functions)
-    – Structuring / smurfing detection
-    – Vendor-level aggregation and flagging
-    – Country-level risk summary
-• Exports results back to pandas DataFrames for downstream scoring / reporting
+Trade-compliance SQL pipeline using SQLite.
+Ingests CSV, performs analytical queries for TBML and smurfing, and exports results.
 """
 
 import sqlite3
 import pandas as pd
 import os
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
-INPUT_CSV   = "metallurgical_ledgers.csv"
-DB_PATH     = "compliance.db"
+# config
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+_DATA_DIR    = os.path.join(_PROJECT_DIR, "data")
+_OUTPUT_DIR  = os.path.join(_PROJECT_DIR, "outputs")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+INPUT_CSV   = os.path.join(_DATA_DIR, "metallurgical_ledgers.csv")
+DB_PATH     = os.path.join(_OUTPUT_DIR, "compliance.db")
 CTR_THRESH  = 10_000.0          # Cash-Transaction-Report threshold (USD)
 SMURFING_LO = CTR_THRESH * 0.75  # Lower bound for structuring detection
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# helpers
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode = WAL;")
@@ -38,15 +28,13 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 1 – Ingest CSV into normalised tables
-# ─────────────────────────────────────────────────────────────────────────────
+# ingest csv into normalized tables
 def ingest_csv(conn: sqlite3.Connection, csv_path: str = INPUT_CSV) -> None:
     """Load the raw CSV and populate all relational tables."""
     print(f"  [SQL] Reading '{csv_path}' …")
     df = pd.read_csv(csv_path, parse_dates=["Date"])
 
-    # ── transactions (main fact table) ──────────────────────────────────────
+    # transactions table
     conn.execute("DROP TABLE IF EXISTS transactions;")
     conn.execute("""
         CREATE TABLE transactions (
@@ -83,7 +71,7 @@ def ingest_csv(conn: sqlite3.Connection, csv_path: str = INPUT_CSV) -> None:
     txn_df.to_sql("transactions", conn, if_exists="append", index=False)
     print(f"  [SQL] Inserted {len(txn_df):,} rows → transactions")
 
-    # ── vendors (dimension table) ────────────────────────────────────────────
+    # vendors table
     conn.execute("DROP TABLE IF EXISTS vendors;")
     conn.execute("""
         CREATE TABLE vendors (
@@ -116,7 +104,7 @@ def ingest_csv(conn: sqlite3.Connection, csv_path: str = INPUT_CSV) -> None:
     vendor_agg.to_sql("vendors", conn, if_exists="append", index=False)
     print(f"  [SQL] Inserted {len(vendor_agg):,} rows → vendors")
 
-    # ── risk_scores (results table – populated later) ────────────────────────
+    # risk scores table
     conn.execute("DROP TABLE IF EXISTS risk_scores;")
     conn.execute("""
         CREATE TABLE risk_scores (
@@ -136,17 +124,9 @@ def ingest_csv(conn: sqlite3.Connection, csv_path: str = INPUT_CSV) -> None:
     print("  [SQL] Schema created: transactions | vendors | risk_scores")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2 – Analytical SQL Queries
-# ─────────────────────────────────────────────────────────────────────────────
+# analytical sql queries
 def query_tbml_patterns(conn: sqlite3.Connection) -> pd.DataFrame:
-    """
-    TBML (Trade-Based Money Laundering) detection using CTEs.
-    Flags vendors with:
-      - Abnormally large price deviations from spot
-      - High transaction frequency in short windows
-      - Transactions with sanctioned countries
-    """
+    """TBML detection using CTEs to flag risky vendors."""
     sql = f"""
     WITH price_deviations AS (
         SELECT
@@ -223,10 +203,7 @@ def query_tbml_patterns(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def query_structuring_alerts(conn: sqlite3.Connection) -> pd.DataFrame:
-    """
-    Structuring / smurfing detection using window functions.
-    Identifies sequences of just-below-threshold transactions per vendor.
-    """
+    """Structuring detection to identify just-below-threshold sequences."""
     sql = f"""
     WITH ranked AS (
         SELECT
@@ -261,9 +238,7 @@ def query_structuring_alerts(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def query_country_risk_summary(conn: sqlite3.Connection) -> pd.DataFrame:
-    """
-    Country-level risk aggregation with running totals (window function).
-    """
+    """Country-level risk aggregation with running totals."""
     sql = """
     WITH country_agg AS (
         SELECT
@@ -301,10 +276,7 @@ def query_country_risk_summary(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def query_commodity_anomalies(conn: sqlite3.Connection) -> pd.DataFrame:
-    """
-    Per-commodity price anomaly detection: find transactions whose unit price
-    deviates more than 2 standard deviations from the commodity mean.
-    """
+    """Per-commodity price anomaly detection (>2 std dev)."""
     sql = """
     WITH stats AS (
         SELECT
@@ -342,10 +314,7 @@ def query_commodity_anomalies(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def query_rolling_weekly_volume(conn: sqlite3.Connection) -> pd.DataFrame:
-    """
-    Rolling 7-day transaction volume per vendor using window functions.
-    Flags vendors with unusually high weekly activity (>2 std devs above mean).
-    """
+    """Rolling 7-day transaction volume per vendor."""
     sql = """
     WITH daily AS (
         SELECT
@@ -381,14 +350,9 @@ def query_rolling_weekly_volume(conn: sqlite3.Connection) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 3 – Upload risk scores back to DB
-# ─────────────────────────────────────────────────────────────────────────────
+# upload risk scores
 def upload_risk_scores(conn: sqlite3.Connection, scored_df: pd.DataFrame) -> None:
-    """
-    Write the scored DataFrame rows into the risk_scores table.
-    Expected columns (subset): transaction_id, *_risk_score, composite_risk_score
-    """
+    """Write scored dataframe rows to risk_scores table."""
     score_cols = [
         "Transaction_ID",
         "ofac_risk_score", "price_delta_risk_score",
@@ -402,9 +366,9 @@ def upload_risk_scores(conn: sqlite3.Connection, scored_df: pd.DataFrame) -> Non
 
     if "composite_risk_score" in rs.columns:
         rs["risk_tier"] = rs["composite_risk_score"].apply(
-            lambda s: "CRITICAL" if s >= 300 else
-                      "HIGH"     if s >= 200 else
-                      "MEDIUM"   if s >= 100 else "LOW"
+            lambda s: "CRITICAL" if s >= 75 else
+                      "HIGH"     if s >= 50 else
+                      "MEDIUM"   if s >= 25 else "LOW"
         )
 
     conn.execute("DELETE FROM risk_scores;")
@@ -413,9 +377,7 @@ def upload_risk_scores(conn: sqlite3.Connection, scored_df: pd.DataFrame) -> Non
     print(f"  [SQL] Uploaded {len(rs):,} rows → risk_scores")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+# main
 def main() -> None:
     DIVIDER = "=" * 65
     print(DIVIDER)
@@ -456,11 +418,11 @@ def main() -> None:
     conn.close()
 
     # Export results
-    tbml_df.to_csv("tbml_alerts.csv", index=False)
-    struct_df.to_csv("structuring_alerts.csv", index=False)
-    country_df.to_csv("country_risk_summary.csv", index=False)
-    anomaly_df.to_csv("commodity_anomalies.csv", index=False)
-    print(f"\n  Exported: tbml_alerts.csv | structuring_alerts.csv | country_risk_summary.csv | commodity_anomalies.csv")
+    tbml_df.to_csv(os.path.join(_OUTPUT_DIR, "tbml_alerts.csv"), index=False)
+    struct_df.to_csv(os.path.join(_OUTPUT_DIR, "structuring_alerts.csv"), index=False)
+    country_df.to_csv(os.path.join(_OUTPUT_DIR, "country_risk_summary.csv"), index=False)
+    anomaly_df.to_csv(os.path.join(_OUTPUT_DIR, "commodity_anomalies.csv"), index=False)
+    print(f"\n  Exported to outputs/: tbml_alerts.csv | structuring_alerts.csv | country_risk_summary.csv | commodity_anomalies.csv")
     print(f"  Database: {DB_PATH}")
     print(f"\n✓ SQL Pipeline complete.\n")
 

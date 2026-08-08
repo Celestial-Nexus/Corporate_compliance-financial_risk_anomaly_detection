@@ -1,21 +1,10 @@
 """
-regression_model.py
-────────────────────────────────────────────────────────────────────────────
-Corporate Compliance – Multi-Variable Regression & Anomaly Flagging
-
-What this does
-──────────────
-• Trains a Logistic Regression (+ optional RandomForest) on the scored
-  metallurgical ledger to predict Is_Fraud_Ground_Truth.
-• Features: numeric transaction columns + encoded categoricals.
-• Prints a full classification report with real accuracy, precision,
-  recall, F1 and ROC-AUC values.
-• Regenerates model_metrics.png from *actual* sklearn metrics.
-• Exports feature importances and calibration curve.
-• Can be run standalone or imported by dashboard.py.
+Trains Logistic Regression and Random Forest models to predict fraud.
+Includes feature engineering, Mahalanobis distance calculation, and evaluation metrics.
 """
 
 import math
+import os
 import warnings
 
 import matplotlib
@@ -45,20 +34,22 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
-INPUT_FILE        = "metallurgical_ledgers_scored.xlsx"
-FALLBACK_CSV      = "metallurgical_ledgers.csv"
+# config
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+_DATA_DIR    = os.path.join(_PROJECT_DIR, "data")
+_OUTPUT_DIR  = os.path.join(_PROJECT_DIR, "outputs")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+INPUT_FILE        = os.path.join(_OUTPUT_DIR, "metallurgical_ledgers_scored.xlsx")
+FALLBACK_CSV      = os.path.join(_DATA_DIR, "metallurgical_ledgers.csv")
 TARGET_COL        = "Is_Fraud_Ground_Truth"
 RANDOM_STATE      = 42
 TEST_SIZE         = 0.20
 MAHAL_THRESHOLD   = 0.975    # Chi-squared percentile for Mahalanobis outlier
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Load & Feature Engineering
-# ─────────────────────────────────────────────────────────────────────────────
+# data loading and feature engineering
 def load_and_engineer(path: str = INPUT_FILE) -> pd.DataFrame:
     """Load scored workbook (or CSV fallback) and create ML features."""
     try:
@@ -68,7 +59,7 @@ def load_and_engineer(path: str = INPUT_FILE) -> pd.DataFrame:
         df = pd.read_csv(FALLBACK_CSV, parse_dates=["Date"])
         print(f"  Fallback to CSV: {FALLBACK_CSV}")
 
-    # ── Make sure ground-truth column exists ─────────────────────────────────
+    # ensure ground-truth column exists
     if TARGET_COL not in df.columns:
         raw = pd.read_csv(FALLBACK_CSV)
         df = df.merge(
@@ -76,23 +67,23 @@ def load_and_engineer(path: str = INPUT_FILE) -> pd.DataFrame:
             on="Transaction_ID", how="left"
         )
 
-    # ── Date-derived features ─────────────────────────────────────────────────
+    # date-derived features
     df["Date"] = pd.to_datetime(df["Date"])
     df["month"]      = df["Date"].dt.month
     df["day_of_week"]= df["Date"].dt.dayofweek
     df["quarter"]    = df["Date"].dt.quarter
 
-    # ── Price deviation ───────────────────────────────────────────────────────
+    # price deviation
     df["price_dev_pct"] = (
         (df["Unit_Price_USD"] - df["Market_Spot_Price"]).abs()
         / df["Market_Spot_Price"].replace(0, np.nan) * 100.0
     )
 
-    # ── Log-transform heavy-tailed columns ───────────────────────────────────
+    # log-transform heavy-tailed columns
     for col in ["Total_Value_USD", "Volume_MT"]:
         df[f"log_{col}"] = np.log1p(df[col].clip(lower=0))
 
-    # ── Categorical encoding ──────────────────────────────────────────────────
+    # categorical encoding
     for col in ["Commodity", "Payment_Method", "Vendor_Country"]:
         le = LabelEncoder()
         df[f"enc_{col}"] = le.fit_transform(df[col].fillna("Unknown"))
@@ -100,14 +91,9 @@ def load_and_engineer(path: str = INPUT_FILE) -> pd.DataFrame:
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Mahalanobis Distance (real implementation)
-# ─────────────────────────────────────────────────────────────────────────────
+# mahalanobis distance
 def compute_mahalanobis(df: pd.DataFrame) -> pd.Series:
-    """
-    Compute per-row Mahalanobis distance using numeric transaction features.
-    Returns a Series of distances (same index as df).
-    """
+    """Compute Mahalanobis distance for numeric features."""
     MAHAL_FEATURES = [
         "Volume_MT", "Unit_Price_USD", "Total_Value_USD",
         "price_dev_pct", "log_Total_Value_USD", "log_Volume_MT",
@@ -134,8 +120,10 @@ def compute_mahalanobis(df: pd.DataFrame) -> pd.Series:
 
 
 def plot_mahalanobis_real(df: pd.DataFrame, dist_series: pd.Series,
-                          threshold: float, filename: str = "mahalanobis_outliers.png") -> None:
-    """Scatter plot using real transaction data coloured by fraud label."""
+                          threshold: float, filename: str = None) -> None:
+    """Scatter plot of Mahalanobis distances."""
+    if filename is None:
+        filename = os.path.join(_OUTPUT_DIR, "mahalanobis_outliers.png")
     plt.style.use("ggplot")
 
     x = df["log_Total_Value_USD"].fillna(0)
@@ -144,8 +132,7 @@ def plot_mahalanobis_real(df: pd.DataFrame, dist_series: pd.Series,
     is_fraud   = df[TARGET_COL].fillna(0).astype(int)
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    fig.suptitle("Mahalanobis Distance – Multivariate Outlier Detection\n"
-                 "(Real Metallurgical Ledger Data)", fontsize=14, fontweight="bold")
+    fig.suptitle("Mahalanobis Distance - Multivariate Outlier Detection", fontsize=14, fontweight="bold")
 
     # Panel 1: Mahalanobis distance distribution
     ax0 = axes[0]
@@ -188,16 +175,14 @@ def plot_mahalanobis_real(df: pd.DataFrame, dist_series: pd.Series,
     print(f"  Saved → {filename}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Logistic Regression + Random Forest
-# ─────────────────────────────────────────────────────────────────────────────
+# models
 FEATURE_COLS = [
     "log_Total_Value_USD", "log_Volume_MT",
     "price_dev_pct", "month", "day_of_week", "quarter",
     "enc_Commodity", "enc_Payment_Method", "enc_Vendor_Country",
 ]
 
-# Append optional risk score columns if present in scored workbook
+# add optional risk scores
 OPTIONAL_SCORE_COLS = [
     "ofac_risk_score", "price_delta_risk_score",
     "smurfing_risk_score", "benfords_law_risk_score",
@@ -212,7 +197,7 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def train_models(df: pd.DataFrame) -> dict:
-    """Train Logistic Regression and Random Forest; return metrics dict."""
+    """Train Logistic Regression and Random Forest models."""
     X = build_feature_matrix(df)
     y = df[TARGET_COL].fillna(0).astype(int)
 
@@ -226,7 +211,7 @@ def train_models(df: pd.DataFrame) -> dict:
 
     results = {}
 
-    # ── Logistic Regression ──────────────────────────────────────────────────
+    # logistic regression
     lr_pipe = Pipeline([
         ("scaler", StandardScaler()),
         ("clf",    LogisticRegression(
@@ -251,7 +236,7 @@ def train_models(df: pd.DataFrame) -> dict:
         "coefs":     dict(zip(X.columns, lr_pipe.named_steps["clf"].coef_[0])),
     }
 
-    # ── Random Forest ────────────────────────────────────────────────────────
+    # random forest
     rf = RandomForestClassifier(
         n_estimators=200, class_weight="balanced",
         max_depth=8, random_state=RANDOM_STATE, n_jobs=-1
@@ -274,7 +259,7 @@ def train_models(df: pd.DataFrame) -> dict:
         "importances": dict(zip(X.columns, rf.feature_importances_)),
     }
 
-    # ── Cross-validated F1 ───────────────────────────────────────────────────
+    # cross-validated f1
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     cv_f1_lr = cross_val_score(lr_pipe, X, y, cv=cv, scoring="f1").mean()
     cv_f1_rf = cross_val_score(rf,       X, y, cv=cv, scoring="f1").mean()
@@ -284,11 +269,11 @@ def train_models(df: pd.DataFrame) -> dict:
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Visualisations (from real metrics)
-# ─────────────────────────────────────────────────────────────────────────────
-def plot_model_metrics(results: dict, filename: str = "model_metrics.png") -> None:
-    """Regenerate model_metrics.png using REAL sklearn metrics."""
+# visualizations
+def plot_model_metrics(results: dict, filename: str = None) -> None:
+    """Bar chart and ROC curve for model metrics."""
+    if filename is None:
+        filename = os.path.join(_OUTPUT_DIR, "model_metrics.png")
     plt.style.use("ggplot")
 
     metric_names = ["Accuracy", "Precision", "Recall", "F1-Score", "ROC-AUC"]
@@ -304,8 +289,7 @@ def plot_model_metrics(results: dict, filename: str = "model_metrics.png") -> No
     width = 0.35
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    fig.suptitle("Compliance Fraud Detection – Model Performance\n(Real sklearn Metrics on Held-Out Test Set)",
-                 fontsize=14, fontweight="bold")
+    fig.suptitle("Compliance Fraud Detection - Model Performance", fontsize=14, fontweight="bold")
 
     # Bar chart: LR vs RF
     ax0 = axes[0]
@@ -347,8 +331,10 @@ def plot_model_metrics(results: dict, filename: str = "model_metrics.png") -> No
     print(f"  Saved → {filename}")
 
 
-def plot_feature_importance(results: dict, filename: str = "feature_importance.png") -> None:
+def plot_feature_importance(results: dict, filename: str = None) -> None:
     """Bar chart of Random Forest feature importances."""
+    if filename is None:
+        filename = os.path.join(_OUTPUT_DIR, "feature_importance.png")
     plt.style.use("ggplot")
     importances = results["RF"]["importances"]
     sorted_items = sorted(importances.items(), key=lambda x: x[1], reverse=True)
@@ -370,8 +356,10 @@ def plot_feature_importance(results: dict, filename: str = "feature_importance.p
     print(f"  Saved → {filename}")
 
 
-def plot_confusion_matrix(results: dict, filename: str = "confusion_matrix.png") -> None:
+def plot_confusion_matrix(results: dict, filename: str = None) -> None:
     """Plot side-by-side confusion matrices for both models."""
+    if filename is None:
+        filename = os.path.join(_OUTPUT_DIR, "confusion_matrix.png")
     plt.style.use("ggplot")
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("Confusion Matrices – Fraud Detection (Real Test Set)",
@@ -388,9 +376,7 @@ def plot_confusion_matrix(results: dict, filename: str = "confusion_matrix.png")
     print(f"  Saved → {filename}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+# main
 def main() -> dict:
     DIVIDER = "=" * 65
     print(DIVIDER)
